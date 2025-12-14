@@ -20,3 +20,6 @@ RuntimeError: Dataset scripts are no longer supported, but found pg19.py
 的问题，这可能是因为你的 datasets 库版本过高。
 
 请尝试降级你的 datasets 库到 3.x.x版本，例如 `pip install datasets=3.6.0`
+
+可以参考 https://github.com/huggingface/datasets/issues/7693#issuecomment-3103380232
+
