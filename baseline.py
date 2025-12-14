@@ -3,6 +3,7 @@ import time
 import torch
 import math
 from tqdm import tqdm
+from calflops import calculate_flops
 
 # 1. 依然要设置镜像，否则下载数据集会报错
 os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -10,7 +11,7 @@ os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
 current_dir = os.getcwd()
 os.environ["HF_HOME"] = os.path.join(current_dir, "hf_cache")
 
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextStreamer
 from datasets import load_dataset
 
 # ================= 配置区域 =================
@@ -72,22 +73,112 @@ def calculate_ppl(text, stride=512):
     return ppl.item()
 
 
-# -------- 定义测试生成速度的函数 --------
+def measure_model_flops(model, tokenizer, device):
+    print("\n" + "=" * 20 + " FLOPs 分析 " + "=" * 20)
+
+    # 模拟一个典型的输入场景
+    batch_size = 1
+    prompt_length = 512
+
+    # 使用 calflops 计算
+    # 直接传递 kwargs 而不是让 calflops 自动生成，避免 tokenizer 兼容性问题
+    # 生成虚拟输入
+    input_ids = torch.ones((batch_size, prompt_length), dtype=torch.long)
+    attention_mask = torch.ones((batch_size, prompt_length), dtype=torch.long)
+
+    kwargs = {"input_ids": input_ids, "attention_mask": attention_mask}
+
+    flops, macs, params = calculate_flops(
+        model=model,
+        kwargs=kwargs,
+        print_results=False,  # 我们手动打印更清晰
+        output_as_string=True,
+    )
+
+    print(f"模型参数量: {params}")
+    print(f"处理 {prompt_length} tokens 的 Prefill 阶段总计算量: {flops}")
+
+    # 估算平均每个 Token 的 FLOPs
+    # 注意：生成阶段因为有 KV Cache，计算量通常显著低于 Prefill 阶段
+    avg_token_flops = float(flops.split()[0]) / prompt_length
+    print(f"平均每个 Token 的近似计算量: {avg_token_flops:.2f} GFLOPS")
+
+    return flops
+
+
+# -------- 定义一个用于速度测试的 Streamer --------
+class SpeedTestStreamer(TextStreamer):
+    def __init__(self, tokenizer, **kwargs):
+        super().__init__(tokenizer, **kwargs)
+        self.start_time = 0
+        self.first_token_time = 0
+        self.token_count = 0
+
+    def on_finalized_text(self, text: str, stream_end: bool = False):
+        # 这个方法会在每个 token 生成后被调用
+        now = time.time()
+        if self.token_count == 0:
+            # 这是第一个 token
+            self.first_token_time = now
+        self.token_count += 1
+        # 可以在这里打印生成的 token，如果不想看可以注释掉
+        # print(text, end="", flush=True)
+
+    def reset(self):
+        self.start_time = 0
+        self.first_token_time = 0
+        self.token_count = 0
+
+
+# -------- 【最终版】定义测试生成速度和显存的函数 --------
 def test_speed(input_text, generate_len=50):
     inputs = tokenizer(input_text, return_tensors="pt").to(DEVICE)
-    print("开始速度测试 (生成 50 个 token)...")
+    streamer = SpeedTestStreamer(tokenizer, skip_prompt=True)
 
-    start_time = time.time()
+    print(
+        f"\n开始速度与显存测试 (Prompt: {inputs['input_ids'].shape[1]} tokens, 生成: {generate_len} tokens)..."
+    )
+
+    # ---- 显存测量准备 ----
+    torch.cuda.empty_cache()  # 清理缓存
+    torch.cuda.reset_peak_memory_stats(DEVICE)  # 重置峰值统计
+
+    # 记录调用 generate 前的时间
+    streamer.reset()
+    streamer.start_time = time.time()
+
     with torch.no_grad():
         model.generate(
-            **inputs, max_new_tokens=generate_len, pad_token_id=tokenizer.eos_token_id
+            **inputs,
+            max_new_tokens=generate_len,
+            pad_token_id=tokenizer.eos_token_id,
+            streamer=streamer,
         )
+
+    # 记录 generate 结束后的时间
     end_time = time.time()
 
-    duration = end_time - start_time
-    speed = generate_len / duration
-    print(f"耗时: {duration:.4f}s, 速度: {speed:.2f} tokens/s")
-    return speed
+    # ---- 获取峰值显存 ----
+    peak_memory_bytes = torch.cuda.max_memory_allocated(DEVICE)
+    peak_memory_mb = peak_memory_bytes / (1024 * 1024)
+
+    # ---- 计算时间指标 ----
+    ttft = streamer.first_token_time - streamer.start_time
+    # 避免 token_count 小于等于 1 时的除零错误
+    if streamer.token_count > 1:
+        tpot = (end_time - streamer.first_token_time) / (streamer.token_count - 1)
+    else:
+        tpot = float("inf")  # 如果只生成一个 token，则 TPOT 无意义
+
+    throughput = streamer.token_count / (end_time - streamer.start_time)
+
+    print("\n--- 性能指标 ---")
+    print(f"峰值显存占用: {peak_memory_mb:.2f} MB")
+    print(f"TTFT (Time To First Token): {ttft:.4f}s")
+    print(f"TPOT (Time Per Output Token): {tpot * 1000:.2f} ms/token")
+    print(f"Throughput (吞吐量): {throughput:.2f} tokens/s")
+    print("----------------")
+    return ttft, tpot, throughput, peak_memory_mb
 
 
 # ================= 任务 1: WikiText 测试 =================
@@ -101,6 +192,9 @@ print(f"WikiText 字符数: {len(wiki_text)}")
 ppl = calculate_ppl(wiki_text)
 print(f"WikiText-2 PPL: {ppl:.2f}")
 
+# 用 wikitext 的一句话来测速
+test_speed(wiki_text[:100], generate_len=100)
+
 
 # ================= 任务 2: PG-19 测试 (单一样本) =================
 print("\n" + "=" * 20 + " 测试 PG-19 (单本) " + "=" * 20)
@@ -109,7 +203,7 @@ pg19_stream = load_dataset(
     "pg19",
     split="test",
     streaming=True,
-    trust_remote_code = True,
+    trust_remote_code=True,
 )
 
 # 取出第一本书作为 sample
@@ -129,6 +223,9 @@ print(f"PG-19 Sample PPL: {pg_ppl:.2f}")
 
 # 2. 测速度 (用开头的一句话作为 prompt)
 prompt = book_text[:100]
-test_speed(prompt)
+test_speed(prompt, generate_len=100)
+
+# 计算 FLOPs
+measure_model_flops(model, tokenizer, DEVICE)
 
 print("\nBaseline 测试完成！")
